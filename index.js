@@ -4,7 +4,6 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
 const { Pool } = require('pg');
 
-// ===== SETUP =====
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
@@ -48,16 +47,20 @@ async function fetchStream(name) {
 }
 
 // ===== DATABASE =====
-async function getStreamers() {
-  const res = await pool.query('SELECT * FROM streamers');
+async function getStreamers(guildId) {
+  const res = await pool.query(
+    'SELECT * FROM streamers WHERE guild_id = $1',
+    [guildId]
+  );
   return res.rows;
 }
 
 async function addStreamer(data) {
   await pool.query(
-    `INSERT INTO streamers (name, channel_id, mention_channel_id, mention_role_id, message)
-     VALUES ($1, $2, $3, $4, $5)`,
+    `INSERT INTO streamers (guild_id, name, channel_id, mention_channel_id, mention_role_id, message)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
     [
+      data.guildId,
       data.name,
       data.channelId,
       data.mentionChannelId,
@@ -67,11 +70,14 @@ async function addStreamer(data) {
   );
 }
 
-async function removeStreamer(name) {
-  await pool.query('DELETE FROM streamers WHERE name = $1', [name]);
+async function removeStreamer(guildId, name) {
+  await pool.query(
+    'DELETE FROM streamers WHERE guild_id = $1 AND name = $2',
+    [guildId, name]
+  );
 }
 
-async function updateStreamer(name, updates) {
+async function updateStreamer(guildId, name, updates) {
   const fields = [];
   const values = [];
   let i = 1;
@@ -83,12 +89,30 @@ async function updateStreamer(name, updates) {
 
   if (!fields.length) return;
 
-  values.push(name);
+  values.push(guildId, name);
 
   await pool.query(
-    `UPDATE streamers SET ${fields.join(', ')} WHERE name = $${i}`,
+    `UPDATE streamers SET ${fields.join(', ')} WHERE guild_id = $${i++} AND name = $${i}`,
     values
   );
+}
+
+async function setDefaultChannel(guildId, channelId) {
+  await pool.query(
+    `INSERT INTO guild_settings (guild_id, default_channel_id)
+     VALUES ($1, $2)
+     ON CONFLICT (guild_id)
+     DO UPDATE SET default_channel_id = EXCLUDED.default_channel_id`,
+    [guildId, channelId]
+  );
+}
+
+async function getDefaultChannel(guildId) {
+  const res = await pool.query(
+    'SELECT default_channel_id FROM guild_settings WHERE guild_id = $1',
+    [guildId]
+  );
+  return res.rows[0]?.default_channel_id || null;
 }
 
 // ===== UTIL =====
@@ -100,60 +124,47 @@ function parseTwitchInput(input) {
   return input;
 }
 
-function formatMessage(template, data) {
-  return (template || '{streamer} is live! {url}')
-    .replace(/{streamer}/g, data.user_name)
-    .replace(/{title}/g, data.title)
-    .replace(/{game}/g, data.game_name)
-    .replace(/{url}/g, `https://twitch.tv/${data.user_login}`);
-}
-
 function createEmbed(stream, message) {
   return new EmbedBuilder()
     .setTitle(`🔴 ${stream.user_name} is LIVE!`)
     .setURL(`https://twitch.tv/${stream.user_login}`)
-    .setDescription(formatMessage(message, stream))
+    .setDescription(message || `${stream.user_name} is live!`)
     .addFields(
       { name: '🎮 Game', value: stream.game_name || 'Unknown', inline: true },
       { name: '👀 Viewers', value: String(stream.viewer_count), inline: true }
     )
-    .setImage(
-      stream.thumbnail_url
-        .replace('{width}', '1280')
-        .replace('{height}', '720')
-    )
+    .setImage(stream.thumbnail_url.replace('{width}', '1280').replace('{height}', '720'))
     .setColor(0x9146FF)
     .setTimestamp();
 }
 
-// ===== STREAM CHECK =====
+// ===== CHECK =====
 async function checkStreams() {
-  const streamers = await getStreamers();
+  const guilds = client.guilds.cache;
 
-  for (const entry of streamers) {
-    const stream = await fetchStream(entry.name);
+  for (const guild of guilds.values()) {
+    const streamers = await getStreamers(guild.id);
 
-    if (stream && !liveCache[entry.name]) {
-      liveCache[entry.name] = true;
+    for (const entry of streamers) {
+      const stream = await fetchStream(entry.name);
 
-      const channel = await client.channels.fetch(entry.channel_id);
+      if (stream && !liveCache[entry.name + guild.id]) {
+        liveCache[entry.name + guild.id] = true;
 
-      let content = '';
-      if (entry.mention_channel_id) content += `<#${entry.mention_channel_id}> `;
-      if (entry.mention_role_id) content += `<@&${entry.mention_role_id}>`;
+        const channel = await client.channels.fetch(entry.channel_id);
 
-      const embed = createEmbed(stream, entry.message);
+        let content = '';
+        if (entry.mention_channel_id) content += `<#${entry.mention_channel_id}> `;
+        if (entry.mention_role_id) content += `<@&${entry.mention_role_id}>`;
 
-      await channel.send({
-        content: content || null,
-        embeds: [embed]
-      });
+        const embed = createEmbed(stream, entry.message);
 
-      console.log(`📢 ${entry.name} went live`);
-    }
+        await channel.send({ content: content || null, embeds: [embed] });
+      }
 
-    if (!stream) {
-      liveCache[entry.name] = false;
+      if (!stream) {
+        liveCache[entry.name + guild.id] = false;
+      }
     }
   }
 }
@@ -162,62 +173,71 @@ async function checkStreams() {
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
+  const guildId = interaction.guildId;
   const raw = interaction.options.getString('name');
   const name = raw ? parseTwitchInput(raw) : null;
 
-  // ADD
-  if (interaction.commandName === 'addstreamer') {
-    const existing = (await getStreamers()).find(s => s.name === name);
+  if (interaction.commandName === 'setchannel') {
+    const channel = interaction.options.getChannel('channel');
+    await setDefaultChannel(guildId, channel.id);
+    return interaction.reply(`✅ Default channel set to ${channel}`);
+  }
 
-    if (existing) {
-      return interaction.reply({ content: 'Already exists', ephemeral: true });
+  if (interaction.commandName === 'addstreamer') {
+    let sendChannel = interaction.options.getChannel('send_channel');
+
+    if (!sendChannel) {
+      const defaultChannel = await getDefaultChannel(guildId);
+      if (!defaultChannel) {
+        return interaction.reply({
+          content: '❌ Use /setchannel or provide a channel.',
+          ephemeral: true
+        });
+      }
+      sendChannel = { id: defaultChannel };
     }
 
     await addStreamer({
+      guildId,
       name,
-      channelId: interaction.options.getChannel('send_channel').id,
+      channelId: sendChannel.id,
       mentionChannelId: interaction.options.getChannel('mention_channel')?.id || null,
       mentionRoleId: interaction.options.getRole('mention_role')?.id || null,
       message: interaction.options.getString('message')
     });
 
-    return interaction.reply(`Added ${name}`);
+    return interaction.reply(`✅ Added ${name}`);
   }
 
-  // REMOVE
   if (interaction.commandName === 'removestreamer') {
-    await removeStreamer(name);
-    return interaction.reply(`Removed ${name}`);
+    await removeStreamer(guildId, name);
+    return interaction.reply(`🗑️ Removed ${name}`);
   }
 
-  // EDIT
   if (interaction.commandName === 'editstreamer') {
     const updates = {};
 
-    const sendChannel = interaction.options.getChannel('send_channel');
-    const mentionChannel = interaction.options.getChannel('mention_channel');
-    const mentionRole = interaction.options.getRole('mention_role');
-    const message = interaction.options.getString('message');
+    if (interaction.options.getChannel('send_channel'))
+      updates.channel_id = interaction.options.getChannel('send_channel').id;
 
-    if (sendChannel) updates.channel_id = sendChannel.id;
-    if (mentionChannel !== null) updates.mention_channel_id = mentionChannel?.id || null;
-    if (mentionRole !== null) updates.mention_role_id = mentionRole?.id || null;
-    if (message !== null) updates.message = message;
+    if (interaction.options.getChannel('mention_channel') !== null)
+      updates.mention_channel_id = interaction.options.getChannel('mention_channel')?.id || null;
 
-    await updateStreamer(name, updates);
+    if (interaction.options.getRole('mention_role') !== null)
+      updates.mention_role_id = interaction.options.getRole('mention_role')?.id || null;
 
-    return interaction.reply(`Updated ${name}`);
+    if (interaction.options.getString('message') !== null)
+      updates.message = interaction.options.getString('message');
+
+    await updateStreamer(guildId, name, updates);
+    return interaction.reply(`✏️ Updated ${name}`);
   }
 
-  // LIST
   if (interaction.commandName === 'liststreamers') {
-    const streamers = await getStreamers();
+    const streamers = await getStreamers(guildId);
     const list = streamers.map(s => `• ${s.name}`).join('\n') || 'None';
 
-    return interaction.reply({
-      content: list,
-      ephemeral: true
-    });
+    return interaction.reply({ content: list, ephemeral: true });
   }
 });
 

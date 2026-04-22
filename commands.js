@@ -8,7 +8,7 @@ const commands = [
     .addStringOption(opt =>
       opt.setName('name').setDescription('Twitch username or link').setRequired(true))
     .addChannelOption(opt =>
-      opt.setName('send_channel').setDescription('Channel to send alerts').setRequired(true))
+      opt.setName('send_channel').setDescription('Channel to send alerts').setRequired(false))
     .addChannelOption(opt =>
       opt.setName('mention_channel').setDescription('Channel to mention').setRequired(false))
     .addRoleOption(opt =>
@@ -38,7 +38,15 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('liststreamers')
-    .setDescription('List all streamers')
+    .setDescription('List all streamers'),
+
+  new SlashCommandBuilder()
+    .setName('setchannel')
+    .setDescription('Set default alert channel')
+    .addChannelOption(opt =>
+      opt.setName('channel')
+        .setDescription('Channel to send alerts in')
+        .setRequired(true))
 ];
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
